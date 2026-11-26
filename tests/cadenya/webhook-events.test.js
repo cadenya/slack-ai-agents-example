@@ -1,10 +1,13 @@
 import assert from 'node:assert';
-import { afterEach, beforeEach, describe, it, mock } from 'node:test';
+import { afterEach, beforeEach, describe, it } from 'node:test';
 
 import { setCadenyaClient } from '../../cadenya/client.js';
 import { threadLabels } from '../../cadenya/thread.js';
 import { handleWebhookEvent } from '../../cadenya/webhook-events.js';
-import { fakeCadenya, THREAD } from './fakes.js';
+import { fakeCadenya, fakeSlack, SILENT_LOGGER, THREAD } from './fakes.js';
+
+let objectiveCount = 0;
+let objectiveId = 'obj_0';
 
 /**
  * @param {Record<string, any>} data
@@ -15,7 +18,7 @@ function webhookEvent(data, extra = {}) {
   return {
     type: 'objective_event.test',
     data: {
-      objective: { id: 'obj_1', labels: threadLabels(THREAD) },
+      objective: { id: objectiveId, labels: threadLabels(THREAD) },
       objectiveEvent: { data },
       ...extra,
     },
@@ -31,34 +34,30 @@ describe('handleWebhookEvent', () => {
   beforeEach(() => {
     cadenya = fakeCadenya();
     setCadenyaClient(cadenya);
-    deps = {
-      client: {
-        chat: { postMessage: mock.fn(async () => ({})) },
-        assistant: { threads: { setStatus: mock.fn(async () => ({})) } },
-        conversations: { replies: mock.fn(async () => ({ messages: [{ user: 'U123', ts: '2.0' }] })) },
-        reactions: { add: mock.fn(async () => ({})) },
-      },
-      logger: { debug: mock.fn(), error: mock.fn() },
-    };
+    objectiveId = `obj_${++objectiveCount}`;
+    deps = { client: fakeSlack(), logger: SILENT_LOGGER };
   });
 
   afterEach(() => setCadenyaClient(undefined));
 
-  it('posts an assistant message into the thread named in the labels', async () => {
+  it('renders an assistant message into the thread named in the labels', async () => {
     await handleWebhookEvent(
       webhookEvent({ type: 'assistantMessage', assistantMessage: { content: 'Hi!', toolCalls: [] } }),
       deps,
     );
-    const message = deps.client.chat.postMessage.mock.calls[0].arguments[0];
-    assert.strictEqual(message.channel, 'C123');
-    assert.strictEqual(message.thread_ts, '1.0');
-    assert.deepStrictEqual(message.blocks[0], { type: 'markdown', text: 'Hi!' });
-    assert.strictEqual(message.blocks[1].type, 'context_actions');
+    const [reply] = deps.client.streams;
+    assert.strictEqual(reply.args.channel, 'C123');
+    assert.strictEqual(reply.args.thread_ts, '1.0');
+    assert.deepStrictEqual(reply.chunks, [{ type: 'markdown_text', text: 'Hi!' }]);
+    assert.strictEqual(reply.stopped.blocks[0].type, 'context_actions');
   });
 
-  it('does not post an assistant message that only requests tool calls', async () => {
-    await handleWebhookEvent(webhookEvent({ type: 'assistantMessage', assistantMessage: { toolCalls: [{}] } }), deps);
-    assert.strictEqual(deps.client.chat.postMessage.mock.callCount(), 0);
+  it('opens no message for an assistant message that only requests tool calls', async () => {
+    await handleWebhookEvent(
+      webhookEvent({ type: 'assistantMessage', assistantMessage: { toolCalls: [{ toolCallId: 'toolcall_1' }] } }),
+      deps,
+    );
+    assert.strictEqual(deps.client.streams.length, 0);
   });
 
   it("does not post a sub-agent's messages, which the parent agent summarizes", async () => {
@@ -70,6 +69,7 @@ describe('handleWebhookEvent', () => {
       deps,
     );
     assert.strictEqual(deps.client.chat.postMessage.mock.callCount(), 0);
+    assert.strictEqual(deps.client.streams.length, 0);
   });
 
   it('ignores objectives that did not start in Slack', async () => {
@@ -98,22 +98,39 @@ describe('handleWebhookEvent', () => {
       name: 'tada',
     });
     assert.deepStrictEqual(cadenya.objectives.setToolCallContent.mock.calls[0].arguments, [
-      'obj_1',
+      objectiveId,
       'toolcall_1',
       { content: [{ type: 'text', text: { text: 'Reacted with :tada:' } }] },
     ]);
   });
 
-  it('shows other tool calls as the thread status', async () => {
+  it('shows other tool calls as tasks in a plan', async () => {
     await handleWebhookEvent(
       webhookEvent({ type: 'toolCalled', toolCalled: { toolCallId: 'toolcall_1', llmToolName: 'search_orders' } }),
+      deps,
+    );
+    assert.deepStrictEqual(deps.client.streams[0].chunks.at(-1), {
+      type: 'task_update',
+      id: 'toolcall_1',
+      title: 'search_orders',
+      status: 'in_progress',
+    });
+    assert.strictEqual(cadenya.objectives.setToolCallContent.mock.callCount(), 0);
+  });
+
+  it("shows a sub-agent's tool calls as the thread status, not in the plan", async () => {
+    await handleWebhookEvent(
+      webhookEvent(
+        { type: 'toolCalled', toolCalled: { toolCallId: 'toolcall_1', llmToolName: 'search_orders' } },
+        { parentObjective: { id: 'obj_parent' }, rootObjective: { id: 'obj_root', labels: threadLabels(THREAD) } },
+      ),
       deps,
     );
     assert.strictEqual(
       deps.client.assistant.threads.setStatus.mock.calls[0].arguments[0].status,
       'Using search_orders…',
     );
-    assert.strictEqual(cadenya.objectives.setToolCallContent.mock.callCount(), 0);
+    assert.strictEqual(deps.client.streams.length, 0);
   });
 
   it('asks for approval with buttons that carry the Cadenya IDs', async () => {
@@ -129,7 +146,7 @@ describe('handleWebhookEvent', () => {
     assert.strictEqual(approve.action_id, 'tool_approve');
     assert.strictEqual(deny.action_id, 'tool_deny');
     assert.deepStrictEqual(JSON.parse(approve.value), {
-      objectiveId: 'obj_1',
+      objectiveId,
       toolCallId: 'toolcall_1',
       toolName: 'refund_order',
     });

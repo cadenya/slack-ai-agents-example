@@ -1,11 +1,12 @@
 import assert from 'node:assert';
 import { createHmac, randomBytes } from 'node:crypto';
 import { Readable } from 'node:stream';
-import { after, before, describe, it, mock } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 import Cadenya from '@cadenya/cadenya';
 
 import { setCadenyaClient } from '../../cadenya/client.js';
 import { cadenyaWebhookRoute } from '../../cadenya/webhook-route.js';
+import { fakeSlack, SILENT_LOGGER } from './fakes.js';
 
 const SECRET_BYTES = randomBytes(24);
 const SECRET = `whsec_${SECRET_BYTES.toString('base64')}`;
@@ -52,11 +53,8 @@ async function deliver(route, headers, body) {
 }
 
 describe('cadenyaWebhookRoute', () => {
-  const postMessage = mock.fn(async () => ({}));
-  const deps = /** @type {any} */ ({
-    client: { chat: { postMessage } },
-    logger: { debug: mock.fn(), error: mock.fn() },
-  });
+  const client = fakeSlack();
+  const deps = /** @type {any} */ ({ client, logger: SILENT_LOGGER });
   const route = cadenyaWebhookRoute(() => deps);
 
   before(() => setCadenyaClient(new Cadenya({ apiKey: 'test-key', webhookSecret: SECRET })));
@@ -65,20 +63,21 @@ describe('cadenyaWebhookRoute', () => {
   it('rejects a delivery with a bad signature', async () => {
     const headers = { ...signedHeaders('msg_bad', BODY), 'webhook-signature': 'v1,AAAA' };
     assert.strictEqual(await deliver(route, headers, BODY), 401);
-    assert.strictEqual(postMessage.mock.callCount(), 0);
+    assert.strictEqual(client.streams.length, 0);
   });
 
   it('handles a signed delivery once, even when Cadenya retries it', async () => {
     assert.strictEqual(await deliver(route, signedHeaders('msg_1', BODY), BODY), 200);
     assert.strictEqual(await deliver(route, signedHeaders('msg_1', BODY), BODY), 200);
-    assert.strictEqual(postMessage.mock.callCount(), 1);
+    assert.strictEqual(client.streams.length, 1);
   });
 
   it('answers 500 so Cadenya retries when Slack is unavailable', async () => {
-    postMessage.mock.mockImplementationOnce(async () => {
+    client.chatStream.mock.mockImplementation(() => {
       throw new Error('slack is down');
     });
     assert.strictEqual(await deliver(route, signedHeaders('msg_2', BODY), BODY), 500);
+    client.chatStream.mock.restore();
     assert.strictEqual(await deliver(route, signedHeaders('msg_2', BODY), BODY), 200);
   });
 });

@@ -33,3 +33,31 @@ export function fakeCadenya(overrides = {}) {
     },
   };
 }
+
+/**
+ * A Slack client whose chat streams record every chunk appended to them.
+ * @returns {any}
+ */
+export function fakeSlack() {
+  /** @type {any[]} */
+  const streams = [];
+  return {
+    streams,
+    chat: { postMessage: mock.fn(async () => ({})) },
+    assistant: { threads: { setStatus: mock.fn(async () => ({})) } },
+    conversations: { replies: mock.fn(async () => ({ messages: [{ user: 'U123', ts: '2.0' }] })) },
+    reactions: { add: mock.fn(async () => ({})) },
+    chatStream: mock.fn((args) => {
+      /** @type {any} */
+      const stream = { args, chunks: [], stopped: undefined };
+      stream.append = mock.fn(async ({ chunks }) => void stream.chunks.push(...chunks));
+      stream.stop = mock.fn(async (stopArgs) => {
+        stream.stopped = stopArgs ?? {};
+      });
+      streams.push(stream);
+      return stream;
+    }),
+  };
+}
+
+export const SILENT_LOGGER = { debug: () => {}, error: () => {} };

@@ -30,20 +30,50 @@ An external ID is never reusable, even after its objective ends. When someone wr
 
 ### What each webhook event does
 
-| Event                                     | In Slack                                                                                                                                                                    |
-| ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `objective_event.assistant_message`       | Posts the reply in the thread, with feedback buttons.                                                                                                                       |
-| `objective_event.tool_called`             | For a client tool defined by this app: runs it and returns the result with `objectives.setToolCallContent`. For any other tool: shows `Using <tool>…` as the thread status. |
-| `objective_event.tool_approval_requested` | Posts Approve and Deny buttons. A click calls `objectives.approveToolCall` or `objectives.denyToolCall`.                                                                    |
-| `objective_event.error`                   | Posts the error in the thread.                                                                                                                                              |
+Every event carries an `iterationId`. Events that share one belong together: an assistant message and the tool calls it asked for. The app opens one Slack message per iteration with [`chat.startStream`](https://docs.slack.dev/reference/methods/chat.startStream/) in `plan` mode, and each webhook appends a chunk to it with [`chat.appendStream`](https://docs.slack.dev/reference/methods/chat.appendStream/).
 
-Events from sub-agents are routed to the thread of the objective that started them. The feedback buttons call `objectives.createFeedback`, which feeds the agent's variation selection.
+| Event                                                      | In Slack                                                                                                                                                                                                                       |
+| ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `objective_event.assistant_message`                        | Appends the text to the iteration's message. The final answer gets feedback buttons.                                                                                                                                           |
+| `objective_event.tool_called`                              | Adds the call to the [plan](https://docs.slack.dev/reference/block-kit/blocks/plan-block/) as an in-progress task. A client tool defined by this app also runs, and its result goes back with `objectives.setToolCallContent`. |
+| `objective_event.tool_result`, `tool_error`, `tool_denied` | Marks the task complete or failed. When the iteration's last call settles, the message closes.                                                                                                                                 |
+| `objective_event.tool_approval_requested`                  | Shows the task as waiting for approval and posts Approve and Deny buttons. A click calls `objectives.approveToolCall` or `objectives.denyToolCall`.                                                                            |
+| `objective_event.error`                                    | Posts the error in the thread.                                                                                                                                                                                                 |
+
+A sub-agent's tool calls stay out of the plan, but its approval requests and errors reach the thread of the objective that started it. The feedback buttons call `objectives.createFeedback`, which feeds the agent's variation selection.
+
+Webhooks carry whole messages. Text deltas are only on Cadenya's live event stream, so the reply arrives in one piece.
 
 ## Setup
 
 The [Building a Slack agent](https://cadenya.com/docs/guides/building-a-slack-agent) guide walks through these steps and the code behind them.
 
-You need the [Slack CLI](https://docs.slack.dev/tools/slack-cli/), the [Cadenya CLI](https://cadenya.com/docs/guides/the-basics/cli), Node.js 22 or later, and a tunnel such as [ngrok](https://ngrok.com/download).
+### Prerequisites
+
+You need:
+
+- The [Slack CLI](https://docs.slack.dev/tools/slack-cli/). Log in with `slack login`.
+- The Cadenya CLI. The next section installs it.
+- Node.js 22 or later.
+- A tunnel such as [ngrok](https://ngrok.com/download).
+
+### Install the Cadenya CLI
+
+Install the CLI with Homebrew:
+
+```sh
+brew install cadenya/tools/cadenya
+```
+
+The [CLI guide](https://cadenya.com/docs/guides/the-basics/cli#install-the-cli) lists the other install options. Then log in and choose a workspace:
+
+```sh
+cadenya auth login
+cadenya workspaces list
+cadenya config set workspace-id development
+```
+
+Replace `development` with the external ID of your workspace.
 
 ### 1. Clone
 
@@ -134,14 +164,17 @@ Then DM the app or @mention it in a channel: "Can you generate me a fake name?"
 - `cadenya/thread.js`: Maps a Slack thread to an objective: external ID, labels, find, create, continue.
 - `cadenya/client-tools.js`: Tools the agent can call that this app executes.
 - `cadenya/webhook-route.js`: Receives webhooks: raw body, signature check, deduplication on `webhook-id`.
-- `cadenya/webhook-events.js`: Turns each webhook event into a Slack action.
+- `cadenya/webhook-events.js`: Routes each webhook event to its Slack thread.
+- `cadenya/thread-renderer.js`: Renders an objective's events as Slack messages, one per iteration, with a plan of tool calls.
+- `cadenya/thread-reply.js`: One streaming Slack message: start, append chunks, stop.
+- `cadenya/thread-actions.js`: Approval requests, client tool runs and error posts.
 - `listeners/events`: Slack messages, @mentions and App Home.
 - `listeners/actions`: Feedback buttons and tool approval buttons.
 - `listeners/views`: Block Kit builders.
 
 ## Going to production
 
-- Webhook deduplication is in memory. With more than one process, store handled `webhook-id` values somewhere shared, with a unique constraint.
+- Webhook deduplication and each iteration's open Slack message are in memory. With more than one process, store handled `webhook-id` values somewhere shared, with a unique constraint, and the stream's `ts` by `iterationId`.
 - The app uses one bot token, so it serves one Slack workspace. For many workspaces, add Bolt's OAuth installation store and pick the token by the `slack_team` label.
 - Host the webhook route on a stable public URL instead of a tunnel.
 
